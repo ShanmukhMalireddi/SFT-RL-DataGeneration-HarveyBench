@@ -170,10 +170,11 @@ async def reward_func(args: Any, samples: list[Any]) -> list[float]:
     return scores
 '''
 
-TRAIN_GRPO_TEMPLATE = '''"""Stage 5 On-Policy GRPO Trainer (TRL + PEFT LoRA) over output/rl_prompts.jsonl.
+TRAIN_GRPO_TEMPLATE = '''"""Stage 5 On-Policy GRPO Trainer (LoRA or Full-Weight) over output/rl_prompts.jsonl.
 
 Runs 100% offline on air-gapped GPUs by default (GRPO_REWARD_MODE=offline),
 or uses Judge API if GRPO_REWARD_MODE=judge is exported.
+Pass --full-weights to update all 9B parameters directly instead of LoRA.
 """
 
 from __future__ import annotations
@@ -192,8 +193,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run conservative on-policy GRPO on Qwen/Qwen3.5-9B")
     parser.add_argument("--model", type=str, default="./checkpoints/qwen35-9b-sft-merged")
     parser.add_argument("--prompts-jsonl", type=str, default="output/rl_prompts.jsonl")
-    parser.add_argument("--output-dir", type=str, default="./checkpoints/qwen35-9b-grpo-lora")
-    parser.add_argument("--lr", type=float, default=2e-7, help="Conservative LR (2e-7 prevents multi-turn forgetting)")
+    parser.add_argument("--output-dir", type=str, default="./checkpoints/qwen35-9b-grpo")
+    parser.add_argument("--full-weights", action="store_true", help="Update all 9B weights directly (4x-8x 80GB GPUs)")
+    parser.add_argument("--lr", type=float, default=None, help="Override learning rate (default: 2e-7 LoRA, 1e-7 full)")
     parser.add_argument("--num-generations", type=int, default=4, help="Group size G per prompt")
     parser.add_argument("--max-steps", type=int, default=80)
     args = parser.parse_args()
@@ -202,25 +204,29 @@ def main() -> None:
         print(f"[GRPO] Merged SFT folder {args.model} not found; falling back to base Qwen/Qwen3.5-9B")
         args.model = "Qwen/Qwen3.5-9B"
 
+    lr = args.lr if args.lr is not None else (1e-7 if args.full_weights else 2e-7)
     dataset = load_dataset("json", data_files=args.prompts_jsonl, split="train")
 
-    peft_cfg = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.0,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        task_type="CAUSAL_LM",
-    )
+    peft_cfg = None
+    if not args.full_weights:
+        peft_cfg = LoraConfig(
+            r=16,
+            lora_alpha=32,
+            lora_dropout=0.0,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            task_type="CAUSAL_LM",
+        )
 
     grpo_cfg = GRPOConfig(
         output_dir=args.output_dir,
-        learning_rate=args.lr,
+        learning_rate=lr,
         beta=0.04,  # KL penalty toward SFT reference
         weight_decay=0.0,
         lr_scheduler_type="cosine",
         warmup_ratio=0.05,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
+        gradient_checkpointing=True,
         num_generations=args.num_generations,
         max_prompt_length=8192,
         max_completion_length=4096,
@@ -231,6 +237,8 @@ def main() -> None:
         save_steps=40,
     )
 
+    mode_str = "FULL-WEIGHT" if args.full_weights else "LoRA"
+    print(f"[GRPO] Starting {mode_str} on-policy GRPO (lr={lr}) from {args.model}...")
     trainer = GRPOTrainer(
         model=args.model,
         reward_funcs=[trl_reward_func],
@@ -240,7 +248,7 @@ def main() -> None:
     )
     trainer.train()
     trainer.save_model(args.output_dir)
-    print(f"[GRPO] Saved on-policy GRPO adapter -> {args.output_dir}")
+    print(f"[GRPO] Saved {mode_str} GRPO checkpoint -> {args.output_dir}")
 
 
 if __name__ == "__main__":
@@ -253,7 +261,7 @@ def write_training_bundle(out_dir: Path) -> Path:
     dpo_path = (out_dir / "dpo_preferences.jsonl").resolve()
     rl_path = (out_dir / "rl_prompts.jsonl").resolve()
 
-    sft_yaml = f"""# Stage 5 Generated Axolotl LoRA SFT Config (Qwen/Qwen3.5-9B)
+    sft_yaml = f"""# Stage 5 Generated Axolotl LoRA SFT Config (1x-2x GPUs)
 base_model: Qwen/Qwen3.5-9B
 chat_template: tokenizer_default
 datasets:
@@ -282,7 +290,37 @@ lr_scheduler: cosine
 warmup_ratio: 0.05
 """
 
-    dpo_yaml = f"""# Stage 5 Generated Axolotl LoRA DPO Config (Run on SFT-merged checkpoint)
+    full_sft_yaml = f"""# Stage 5 Generated Axolotl Full-Weight 9B SFT Config (FSDP2 on 4x-8x 80GB+ GPUs)
+base_model: Qwen/Qwen3.5-9B
+chat_template: tokenizer_default
+datasets:
+  - path: {sft_path}
+    ds_type: json
+    type: chat_template
+    field_messages: messages
+    roles_to_train: [assistant]
+output_dir: ./checkpoints/qwen35-9b-sft-merged
+sequence_len: 16384
+sample_packing: true
+bf16: auto
+flash_attention: true
+gradient_checkpointing: true
+micro_batch_size: 1
+gradient_accumulation_steps: 4
+num_epochs: 2
+optimizer: adamw_torch_fused
+learning_rate: 0.00001
+lr_scheduler: cosine
+warmup_ratio: 0.05
+weight_decay: 0.01
+fsdp_version: 2
+fsdp_config:
+  fsdp_sharding_strategy: FULL_SHARD
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_state_dict_type: FULL_STATE_DICT
+"""
+
+    dpo_yaml = f"""# Stage 5 Generated Axolotl LoRA DPO Config (Run on SFT checkpoint)
 base_model: ./checkpoints/qwen35-9b-sft-merged
 chat_template: tokenizer_default
 rl: dpo
@@ -311,33 +349,45 @@ learning_rate: 0.000005
 
     launch_sh = f"""#!/usr/bin/env bash
 set -euo pipefail
-# Run on a GPU machine (2x-8x A100/H100/H200).
-# STAGE5_RL_MODE can be: grpo (default, uses rl_prompts.jsonl) | dpo (uses dpo_preferences.jsonl) | none
+# Run on a GPU machine:
+#   STAGE5_WEIGHT_MODE: lora (default, 1x-2x GPUs) | full (all 9B params via FSDP2, 4x-8x 80GB GPUs)
+#   STAGE5_RL_MODE:     grpo (default, on-policy rl_prompts.jsonl) | dpo (offline dpo_preferences.jsonl) | none
+STAGE5_WEIGHT_MODE="${{STAGE5_WEIGHT_MODE:-lora}}"
 STAGE5_RL_MODE="${{STAGE5_RL_MODE:-grpo}}"
 
-echo "[1/3] Running Stage-5 LoRA SFT..."
-accelerate launch -m axolotl.cli.train output/axolotl_sft.yaml
-
-echo "[2/3] Merging SFT LoRA into base model..."
-python3 -m axolotl.cli.merge_lora output/axolotl_sft.yaml \\
-  --lora-model-dir ./checkpoints/qwen35-9b-sft-lora \\
-  --output-dir ./checkpoints/qwen35-9b-sft-merged
+if [ "$STAGE5_WEIGHT_MODE" = "full" ]; then
+  echo "[1/2] Running Stage-5 FULL-WEIGHT 9B SFT (FSDP2)..."
+  accelerate launch -m axolotl.cli.train output/axolotl_full_sft.yaml
+else
+  echo "[1/2] Running Stage-5 LoRA SFT..."
+  accelerate launch -m axolotl.cli.train output/axolotl_sft.yaml
+  echo "      Merging SFT LoRA into standalone 9B checkpoint..."
+  python3 -m axolotl.cli.merge_lora output/axolotl_sft.yaml \\
+    --lora-model-dir ./checkpoints/qwen35-9b-sft-lora \\
+    --output-dir ./checkpoints/qwen35-9b-sft-merged
+fi
 
 if [ "$STAGE5_RL_MODE" = "grpo" ] && [ -s "{rl_path}" ]; then
-  echo "[3/3] Running Stage-5 On-Policy GRPO (lr=2e-7, offline deterministic rubric reward by default)..."
+  GRPO_EXTRA=""
+  if [ "$STAGE5_WEIGHT_MODE" = "full" ]; then
+    GRPO_EXTRA="--full-weights"
+  fi
+  echo "[2/2] Running Stage-5 On-Policy GRPO ($STAGE5_WEIGHT_MODE mode)..."
   PYTHONPATH=output accelerate launch output/train_grpo.py \\
     --model ./checkpoints/qwen35-9b-sft-merged \\
     --prompts-jsonl "{rl_path}" \\
-    --output-dir ./checkpoints/qwen35-9b-grpo-lora
+    --output-dir "./checkpoints/qwen35-9b-grpo-$STAGE5_WEIGHT_MODE" \\
+    $GRPO_EXTRA
 elif [ "$STAGE5_RL_MODE" = "dpo" ] && [ -s "{dpo_path}" ]; then
-  echo "[3/3] Running Stage-5 Offline DPO refinement..."
+  echo "[2/2] Running Stage-5 Offline DPO refinement..."
   accelerate launch -m axolotl.cli.train output/axolotl_dpo.yaml
 else
-  echo "[3/3] Skipping RL/DPO refinement (STAGE5_RL_MODE=$STAGE5_RL_MODE)."
+  echo "[2/2] Skipping RL/DPO refinement (STAGE5_RL_MODE=$STAGE5_RL_MODE)."
 fi
 """
 
     (out_dir / "axolotl_sft.yaml").write_text(sft_yaml, encoding="utf-8")
+    (out_dir / "axolotl_full_sft.yaml").write_text(full_sft_yaml, encoding="utf-8")
     (out_dir / "axolotl_dpo.yaml").write_text(dpo_yaml, encoding="utf-8")
     (out_dir / "reward_grpo.py").write_text(REWARD_GRPO_TEMPLATE, encoding="utf-8")
     (out_dir / "train_grpo.py").write_text(TRAIN_GRPO_TEMPLATE, encoding="utf-8")
