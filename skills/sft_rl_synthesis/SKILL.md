@@ -15,7 +15,12 @@ Follow every rule below when synthesizing `(task_prompt, rubric, reasoning, answ
 - **No fabricated placeholders:** Never output `[Company A]`, `[Insert Date]`, `[TBD]`, or `...` unless that literal string appears in the source document.
 - **Reject thin excerpts:** If a document excerpt lacks concrete legal rules, clauses, or holdings, focus strictly on the operative provisions present rather than inventing background facts.
 
-## 2. Prompt Design (`task_prompt`) for Maximum Gradient Signal
+## 2. Content-Aware Task Matching & Prompt Design (`task_prompt`)
+- **Match task type to document kind (`selected_task_type`):**
+  - *Contracts / Agreements:* Eligible for `issue_spotting_and_risk_redline`, `legal_memo`, `compliance_checklist_table`, or `clause_extraction_qa`.
+  - *Judicial Opinions / Case Law:* Use `legal_memo` or `clause_extraction_qa` ONLY (never force contract redlining onto a court opinion).
+  - *Statutes / Regulations / Tax Instructions:* Use `compliance_checklist_table`, `legal_memo`, or `clause_extraction_qa` (never contract redlining).
+  - If `Preferred Task Type` does not naturally fit the excerpt, select the best-fitting option from `Compatible Task Types` and return it in `selected_task_type`.
 - **Ban generic summaries:** Never write prompts like `"Summarize this document"` or `"Explain the main points"`. Base `Qwen/Qwen3.5-9B` already passes generic summaries, yielding near-zero SFT/RL learning signal.
 - **Require multi-clause / cross-document reasoning:** Design realistic practitioner assignments that force the student model to combine 3+ specific provisions:
   - *Legal Memo:* Reconcile a general rule with its carve-outs, conditions precedent, notice windows, and liability caps across multiple sections/documents.
