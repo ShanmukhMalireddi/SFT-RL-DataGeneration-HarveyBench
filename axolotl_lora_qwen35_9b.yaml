@@ -1,0 +1,41 @@
+# Axolotl LoRA SFT Config for Qwen/Qwen3.5-9B (Run on Remote GPU Machine)
+base_model: Qwen/Qwen3.5-9B
+chat_template: tokenizer_default
+
+datasets:
+  - path: ./output/sft_train.jsonl
+    ds_type: json
+    type: chat_template
+    field_messages: messages
+    roles_to_train: [assistant]   # Loss computed on assistant tokens only
+
+output_dir: ./checkpoints/qwen35-9b-harvey-lora
+
+adapter: lora
+lora_r: 32
+lora_alpha: 64
+lora_dropout: 0.05
+# SGLang-safe linear projections (exclude linear_attn.*, model.visual.*, mtp.*)
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+sequence_len: 16384
+sample_packing: true
+bf16: auto
+flash_attention: true
+gradient_checkpointing: true
+
+micro_batch_size: 1
+gradient_accumulation_steps: 8
+num_epochs: 2
+optimizer: adamw_torch_fused
+learning_rate: 0.0001
+lr_scheduler: cosine
+warmup_ratio: 0.05
+weight_decay: 0.01
