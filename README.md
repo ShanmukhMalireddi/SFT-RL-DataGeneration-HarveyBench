@@ -1,46 +1,76 @@
 # Harvey Legal Synthetic Post-Training Pipeline (`Qwen/Qwen3.5-9B`)
 
-Contamination-free 5-stage synthetic legal data generation, rubric verification, and post-training pipeline (SFT, GRPO RL, and DPO) built over 142,959 decontaminated legal documents across 49 practice domains. Zero external pip dependencies required on Cloudtop (standard Python 3.12).
+Contamination-free 5-stage synthetic legal data generation, rubric verification, and post-training pipeline (SFT, GRPO RL, and DPO) built over 142,959 decontaminated legal documents across 49 practice domains. Runs on standard Python 3.12 with zero external pip dependencies required on Cloudtop.
 
 ---
 
-## Architecture: What Each Stage Does
+## Stage-by-Stage Overview
 
-| Stage / File | Inputs | What It Does | Outputs |
-| :--- | :--- | :--- | :--- |
-| **Stage 1**<br>`stage1_generate_configs.py` | `./harvey_lab_corpus/` (or `.zip`), optional `eval_feedback.json` | Scans all 49 clean legal domains, sets task-type mixes (`legal_memo`, `issue_spotting_and_risk_redline`, `compliance_checklist_table`, `clause_extraction_qa`), and automatically boosts target quotas by `1.75x-2.5x` on weak domains (`score < 0.70`) from prior rounds. | `output/domain_configs.json` |
-| **Stage 2**<br>`stage2_synthesize.py` | `domain_configs.json`, `SKILL.md`, Teacher API (`gemini-argon-4`) | Strips web-scrape boilerplate from raw legal files, samples 1-2 substantive documents per task, and runs multi-threaded resumable Teacher calls to synthesize closed-world `(task_prompt, rubric, reasoning, answer)` candidates. | `output/raw_candidates.jsonl` |
-| **Stage 3**<br>`stage3_clean_and_filter.py` | `raw_candidates.jsonl`, `SKILL.md`, Judge API | Enforces structural and packet-grounding checks, removes exact and near-duplicate samples (5-gram Jaccard), grades every candidate against its atomic rubric (`temperature=0.0`), keeps only rows with `rubric_score >= 0.90`, and locks an untouched 10% holdout split. | `output/sft_train.jsonl`<br>`output/rl_prompts.jsonl`<br>`output/holdout_eval.jsonl`<br>`output/filter_stats.json` |
-| **Stage 4**<br>`stage4_eval_and_feedback.py` | `sft_train.jsonl`, Student API (`Qwen/Qwen3.5-9B`), Judge API | Rolls out the Student model on training prompts, pairs Teacher vs. Student answers into `(chosen, rejected)` preference rows whenever `chosen_score - rejected_score >= 0.25`, and records per-domain weakness scores to drive Round-2 Stage-1 sampling. | `output/dpo_preferences.jsonl`<br>`output/eval_feedback.json` |
-| **Stage 5**<br>`stage5_train_and_benchmark.py` | `holdout_eval.jsonl`, `sft_train.jsonl`, `dpo_preferences.jsonl` | Generates ready-to-run GPU training configs (assistant-only loss masking, SGLang-safe LoRA modules) plus a launch script, and benchmarks Candidate vs. Baseline models on the untouched `holdout_eval.jsonl` split. | `output/axolotl_sft.yaml`<br>`output/axolotl_dpo.yaml`<br>`output/launch_gpu_training.sh`<br>`output/stage5_benchmark_report.md` |
+### Stage 1: Domain Discovery & Task Config (`stage1_generate_configs.py`)
+- **Input:** Unzipped `./harvey_lab_corpus/` folder (or `.zip`), plus optional `output/eval_feedback.json` from a previous round.
+- **What it does:** Scans all 49 clean legal domain folders and defines the 4-task synthesis mix (`legal_memo`, `issue_spotting_and_risk_redline`, `compliance_checklist_table`, and `clause_extraction_qa`) along with per-domain sample quotas.
+- **Output:** `output/domain_configs.json`.
 
-### Supporting Files
-- `skills/sft_rl_synthesis/SKILL.md`: Prompting & grading rules injected into Teacher and Judge system prompts (enforces closed-world packet grounding, bans low-signal summary tasks, calibrates 4-7 atomic rubric items for GRPO variance, and prevents meta-leakage in `<think>` traces).
+### Stage 2: Boilerplate Cleaning & Teacher Synthesis (`stage2_synthesize.py`)
+- **Input:** `output/domain_configs.json`, `skills/sft_rl_synthesis/SKILL.md`, and `TEACHER_API_KEY` (`gemini-argon-4`).
+- **What it does:** Strips web-navigation boilerplate from raw legal files, samples 1-2 substantive documents per task, and runs parallel resumable Teacher calls (`gemini-argon-4` guided by `SKILL.md`) to synthesize closed-world `(task_prompt, rubric, reasoning, answer)` candidates.
+- **Output:** `output/raw_candidates.jsonl` (resumable: re-running skips already-generated IDs).
+
+### Stage 3: Deduplication, Judge Verification & Holdout Split (`stage3_clean_and_filter.py`)
+- **Input:** `output/raw_candidates.jsonl`, `skills/sft_rl_synthesis/SKILL.md`, and Judge API (reuses `gemini-argon-4` at `temperature=0.0` unless separate `JUDGE_*` keys are set).
+- **What it does:** Runs deterministic structural/packet-grounding checks, drops exact and near-duplicate answers (5-gram Jaccard similarity), grades every candidate against its atomic rubric, keeps only verified high-quality rows (`rubric_score >= 0.90`), and splits them deterministically (`md5(row["id"])`):
+  - **90% Train:** Written to `output/sft_train.jsonl` (pointwise SFT) and `output/rl_prompts.jsonl` (GRPO / RFT prompts + rubrics).
+  - **10% Locked Holdout:** Written **exclusively** to `output/holdout_eval.jsonl` (never included in SFT, RL, or DPO training).
+- **Output:** `output/sft_train.jsonl`, `output/rl_prompts.jsonl`, `output/holdout_eval.jsonl`, and `output/filter_stats.json`.
+
+### Stage 4: Student Rollouts, DPO Pairs & Failure Feedback (`stage4_eval_and_feedback.py`)
+- **Input:** `output/sft_train.jsonl`, `STUDENT_*` endpoint (`Qwen/Qwen3.5-9B`), and Judge API. *(Skipped when `--skip-student-eval` is passed.)*
+- **What it does:** Generates candidate answers from `Qwen/Qwen3.5-9B` on `sft_train.jsonl` prompts (never touching `holdout_eval.jsonl`), grades them with the Judge, creates `(chosen, rejected)` DPO pairs whenever `teacher_score - student_score >= 0.25`, and computes `Qwen`'s average score per legal domain.
+- **Output:** `output/dpo_preferences.jsonl` and `output/eval_feedback.json`.
+
+### Stage 5: GPU Training Bundle & Holdout Benchmarking (`stage5_train_and_benchmark.py`)
+- **Input:** `output/sft_train.jsonl`, `output/dpo_preferences.jsonl`, and `output/holdout_eval.jsonl`.
+- **What it does:** Writes ready-to-run GPU training configs (assistant-only loss masking, SGLang-safe LoRA modules) and a bash launch script. When a Student endpoint is active, it also benchmarks Candidate vs. Baseline models on the untouched `output/holdout_eval.jsonl` split.
+- **Output:** `output/axolotl_sft.yaml`, `output/axolotl_dpo.yaml`, `output/launch_gpu_training.sh`, and `output/stage5_benchmark_report.md` (+ `.json`).
+
+---
+
+## How `eval_feedback.json` Works (Round 1 vs. Round 2 Loop)
+
+`output/eval_feedback.json` is the automatic hard-domain scorecard connecting Stage 4 back to Stage 1:
+
+1. **Round 1 (First Run -- `eval_feedback.json` does not exist yet):**
+   Stage 1 gives every one of the 49 legal domains the exact same quota (for example, `--samples-per-domain 20` -> `20` tasks per domain). If you only want a single data-generation pass (`--skip-student-eval`), you never need `eval_feedback.json`.
+2. **After Stage 4 Runs (`eval_feedback.json` now exists):**
+   Stage 4 tests `Qwen/Qwen3.5-9B` and records per-domain scores (e.g., `01_delaware_corporate: 0.88`, `14_tax_controversy: 0.42`).
+3. **Round 2 (Re-running `run_pipeline.py`):**
+   Stage 1 automatically reads `output/eval_feedback.json` and boosts quotas **only** on weak domains while skipping already-generated IDs:
+   - **Domain score `>= 0.70`:** Quota stays `20` (`0` new API calls spent on easy domains).
+   - **Domain score `0.50 - 0.69`:** Quota boosted **`1.75x`** (`20 -> 35`, generating `15` extra tasks).
+   - **Domain score `< 0.50`:** Quota boosted **`2.5x`** (`20 -> 50`, generating `30` extra tasks).
+
+---
+
+## Supporting Files
+
 - `api_keys.env`: Single config file for `TEACHER_API_KEY`, `TEACHER_MODEL` (`gemini-argon-4`), optional `JUDGE_*`, and optional `STUDENT_*` endpoints (auto-loaded on startup).
-- `llm_client.py`: Unified HTTP client supporting both native Google Gemini `generateContent` and OpenAI-compatible `/chat/completions` endpoints, plus `--mock` offline testing.
-- `run_pipeline.py`: End-to-end CLI entrypoint orchestrating Stages 1 through 5.
-
-### Train vs. Holdout Split (`output/holdout_eval.jsonl`)
-- Created in **Stage 3** (`stage3_clean_and_filter.py`) immediately after deduplication and Judge verification (`rubric_score >= 0.90`).
-- Uses a deterministic hash on each verified sample ID (`md5(row["id"])`):
-  - **`10%` (`bucket < 0.10`)** are written **exclusively** to `output/holdout_eval.jsonl` (never included in `sft_train.jsonl` or `rl_prompts.jsonl`).
-  - **`90%`** are written to `output/sft_train.jsonl` and `output/rl_prompts.jsonl`.
-- **Stage 4** (`stage4_eval_and_feedback.py`) builds `output/dpo_preferences.jsonl` and domain weakness feedback strictly from `sft_train.jsonl`, leaving `holdout_eval.jsonl` completely untouched by training or Round-2 curriculum selection.
-- **Stage 5** (`stage5_train_and_benchmark.py`) evaluates Candidate vs. Baseline models on `output/holdout_eval.jsonl` and writes `output/stage5_benchmark_report.md` + `.json`.
+- `skills/sft_rl_synthesis/SKILL.md`: Synthesis and grading rules injected into Teacher and Judge system prompts (closed-world packet grounding, multi-clause legal tasks, 4-7 atomic rubric checks for GRPO variance, clean `<think>` reasoning with zero meta-leakage).
+- `llm_client.py`: Unified HTTP client supporting native Google Gemini `generateContent` and OpenAI-compatible `/chat/completions` endpoints, plus `--mock` offline testing.
+- `run_pipeline.py`: Main CLI orchestrator running Stages 1 through 5.
 
 ---
 
-## How to Run
+## Running Instructions
 
-### 1. Configure `api_keys.env` & Test Connection
-Place the unzipped `harvey_lab_corpus/` folder inside `harvey_synth_pipeline/` (auto-detected by default), paste your key into `api_keys.env`, and test connectivity:
+### 1. Setup & Connectivity Test
+Place the unzipped `harvey_lab_corpus/` folder inside `harvey_synth_pipeline/`, paste your key into `api_keys.env`, and test connectivity:
 
 ```bash
 cd ~/harvey_synth_pipeline
 python3 run_pipeline.py --test-api
 ```
 
-### 2. Quick Pilot Run (2 Domains x 4 Samples = 8 Tasks)
+### 2. Pilot Run (2 Domains x 4 Samples = 8 Tasks)
 ```bash
 python3 run_pipeline.py \
   --limit-domains 2 \
@@ -49,19 +79,17 @@ python3 run_pipeline.py \
   --skip-student-eval
 ```
 
-### 3. Full 49-Domain SFT + RL Dataset Generation (Stages 1-3 + Stage 5 Configs)
+### 3. Full 49-Domain SFT + RL Dataset Generation
 ```bash
 python3 run_pipeline.py \
   --samples-per-domain 20 \
   --workers 16 \
   --skip-student-eval
 ```
-*(Stage 2 is resumable: if interrupted, re-running skips already-generated IDs in `output/raw_candidates.jsonl`.)*
 
 ### 4. GPU Training + Stage 4 DPO & Stage 5 Holdout Benchmark
 1. Run `bash output/launch_gpu_training.sh` on your GPU machine (`axolotl` LoRA SFT / DPO).
-2. Serve `Qwen/Qwen3.5-9B` (base or fine-tuned) on `STUDENT_BASE_URL` in `api_keys.env` and run without `--skip-student-eval`:
+2. Set `STUDENT_BASE_URL` in `api_keys.env` to your served `Qwen/Qwen3.5-9B` endpoint and run without `--skip-student-eval`:
    ```bash
    python3 run_pipeline.py --samples-per-domain 20 --workers 16
    ```
-   Re-running `run_pipeline.py` afterward automatically reads `output/eval_feedback.json` in Stage 1 to oversample any domain scoring `< 0.70`.
