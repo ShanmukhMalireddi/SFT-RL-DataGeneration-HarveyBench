@@ -1,10 +1,3 @@
----
-name: sft-rl-legal-data-synthesis
-description: >-
-  Rules and quality standards for generating high-signal pointwise SFT trajectories,
-  verifiable RL prompts, and atomic grading rubrics from raw legal corpus packets
-  for post-training Qwen/Qwen3.5-9B.
----
 
 # Skill: High-Signal SFT & RL Legal Data Synthesis (`Qwen/Qwen3.5-9B`)
 
