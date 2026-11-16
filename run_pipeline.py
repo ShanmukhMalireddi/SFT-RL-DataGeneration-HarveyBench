@@ -10,7 +10,8 @@ from llm_client import ChatClient, load_env_file
 from stage1_generate_configs import build_domain_configs
 from stage2_synthesize import run_stage2_synthesis
 from stage3_clean_and_filter import run_stage3_filter_and_split
-from stage4_eval_and_feedback import run_stage4_eval_and_dpo
+from stage4_eval_and_feedback import run_stage4_dpo_and_feedback
+from stage5_train_and_benchmark import run_stage5_holdout_benchmark
 
 CLOUDTOP_ARTIFACT_ZIP = Path(
     "/usr/local/google/home/malireddi/.gemini/jetski/brain/95036e22-0ed9-4fec-90bc-f25602fd0066/harvey_lab_corpus.zip"
@@ -164,13 +165,36 @@ def main() -> None:
 
             judge.complete = mock_judge_complete  # type: ignore[method-assign]
 
-        print(f"[Stage 4 & 5] Benchmarking Student ({student.model}) on holdout + building DPO pairs...")
-        fb = run_stage4_eval_and_dpo(out_dir=work_dir, student=student, judge=judge, workers=args.workers)
+        print(f"[Stage 4] Rolling out Student ({student.model}) to build DPO pairs + domain feedback...")
+        fb = run_stage4_dpo_and_feedback(
+            out_dir=work_dir,
+            student=student,
+            judge=judge,
+            workers=args.workers,
+            skill_text=skill_text,
+        )
         print(
-            f"  Holdout mean: {fb['overall_holdout_mean']} | "
+            f"  Rollout mean: {fb['student_train_rollout_mean']} | "
             f"DPO pairs: {fb['dpo_pairs_created']} | "
             f"Weak domains (<0.70): {len(fb['weak_domains_under_0_70'])}"
         )
+
+        print(f"[Stage 5] Generating GPU training bundle & benchmarking ({student.model}) on immutable holdout...")
+        s5 = run_stage5_holdout_benchmark(
+            out_dir=work_dir,
+            judge=judge,
+            candidate_student=student,
+            workers=args.workers,
+            skill_text=skill_text,
+        )
+        print(
+            f"  Holdout score: {s5.get('candidate_holdout_mean')} | "
+            f"Training script: {s5['training_launch_script']}"
+        )
+    else:
+        print("[Stage 5] Writing ready-to-run GPU training configs & launch_gpu_training.sh (student eval skipped)...")
+        s5 = run_stage5_holdout_benchmark(out_dir=work_dir, judge=judge, candidate_student=None, skill_text=skill_text)
+        print(f"  Training script ready: {s5['training_launch_script']}")
 
     print(f"\nDone! Outputs written under: {work_dir}")
 
