@@ -35,10 +35,12 @@ Contamination-free 5-stage synthetic legal data generation, rubric verification,
 - **What it does:** Generates candidate answers from `Qwen/Qwen3.5-9B` on `sft_train.jsonl` prompts (never touching `holdout_eval.jsonl`), grades them with the Judge, creates `(chosen, rejected)` DPO pairs whenever `teacher_score - student_score >= 0.25`, and computes `Qwen`'s average score per legal domain.
 - **Output:** `output/dpo_preferences.jsonl` and `output/eval_feedback.json`.
 
-### Stage 5: GPU Training Bundle & Holdout Benchmarking (`stage5_train_and_benchmark.py`)
-- **Input:** `output/sft_train.jsonl`, `output/dpo_preferences.jsonl`, and `output/holdout_eval.jsonl`.
-- **What it does:** Writes ready-to-run GPU training configs (assistant-only loss masking, SGLang-safe LoRA modules) and a bash launch script. When a Student endpoint is active, it also benchmarks Candidate vs. Baseline models on the untouched `output/holdout_eval.jsonl` split.
-- **Output:** `output/axolotl_sft.yaml`, `output/axolotl_dpo.yaml`, `output/launch_gpu_training.sh`, and `output/stage5_benchmark_report.md` (+ `.json`).
+### Stage 5: GPU Training Bundle (SFT + On-Policy GRPO + DPO) & Holdout Benchmarking (`stage5_train_and_benchmark.py`)
+- **Input:** `output/sft_train.jsonl`, `output/rl_prompts.jsonl`, `output/dpo_preferences.jsonl`, and `output/holdout_eval.jsonl`.
+- **What it does:**
+  1. **Writes SFT + On-Policy GRPO + DPO GPU bundle:** Generates `axolotl` configs for SFT and DPO, plus a complete **on-policy GRPO** reward function (`output/reward_grpo.py`, compatible with both HuggingFace `TRL GRPOTrainer` and ARB `miles`, working 100% offline via deterministic rubric-anchor/format/anti-loop checks or via Judge API when `GRPO_REWARD_MODE=judge` is set) and a conservative GRPO trainer (`output/train_grpo.py` at `lr=2e-7`, `KL beta=0.04`).
+  2. **Benchmarks on locked holdout:** When a Student endpoint is active, evaluates Candidate vs. Baseline models on the untouched `output/holdout_eval.jsonl` split.
+- **Output:** `output/axolotl_sft.yaml`, `output/reward_grpo.py`, `output/train_grpo.py`, `output/axolotl_dpo.yaml`, `output/launch_gpu_training.sh`, and `output/stage5_benchmark_report.md` (+ `.json`).
 
 ---
 
@@ -96,8 +98,13 @@ python3 run_pipeline.py \
   --skip-student-eval
 ```
 
-### 4. GPU Training + Stage 4 DPO & Stage 5 Holdout Benchmark
-1. Run `bash output/launch_gpu_training.sh` on your GPU machine (`axolotl` LoRA SFT / DPO).
+### 4. GPU Training (`SFT -> On-Policy GRPO` or `SFT -> DPO`) & Holdout Benchmark
+1. On your GPU machine, `launch_gpu_training.sh` runs **LoRA SFT -> Merge -> On-Policy GRPO (`rl_prompts.jsonl`)** by default (100% offline deterministic reward; or set `STAGE5_RL_MODE=dpo` to run DPO instead):
+   ```bash
+   bash output/launch_gpu_training.sh
+   # Or for offline DPO instead of GRPO:
+   STAGE5_RL_MODE=dpo bash output/launch_gpu_training.sh
+   ```
 2. Set `STUDENT_BASE_URL` in `api_keys.env` to your served `Qwen/Qwen3.5-9B` endpoint and run without `--skip-student-eval`:
    ```bash
    python3 run_pipeline.py --samples-per-domain 20 --workers 16
