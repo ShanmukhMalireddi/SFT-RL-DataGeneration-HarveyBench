@@ -6,19 +6,26 @@ Contamination-free 5-stage synthetic legal data generation, rubric verification,
 
 ## Stage-by-Stage Overview
 
-### Stage 1: Domain Discovery & Task Config (`stage1_generate_configs.py`)
+### Stage 1: Domain Discovery & Task Quotas (`stage1_generate_configs.py`)
 - **Input:** Unzipped `./harvey_lab_corpus/` folder (or `.zip`), plus optional `output/eval_feedback.json` from a previous round.
-- **What it does:** Scans all 49 clean legal domain folders and defines the 4-task synthesis mix (`legal_memo`, `issue_spotting_and_risk_redline`, `compliance_checklist_table`, and `clause_extraction_qa`) along with per-domain sample quotas.
+- **What it does:** Scans all 49 clean legal domain folders, registers the 4 core legal task formats (`legal_memo`, `issue_spotting_and_risk_redline`, `compliance_checklist_table`, and `clause_extraction_qa`), and computes how many samples (`target_samples` quota) to create inside each domain.
 - **Output:** `output/domain_configs.json`.
 
-### Stage 2: Boilerplate Cleaning & Teacher Synthesis (`stage2_synthesize.py`)
+### Stage 2: Content-Aware Task Matching & Teacher Synthesis (`stage2_synthesize.py`)
 - **Input:** `output/domain_configs.json`, `skills/sft_rl_synthesis/SKILL.md`, and `TEACHER_API_KEY` (`gemini-argon-4`).
-- **What it does:** Strips web-navigation boilerplate from raw legal files, samples 1-2 substantive documents per task, and runs parallel resumable Teacher calls (`gemini-argon-4` guided by `SKILL.md`) to synthesize closed-world `(task_prompt, rubric, reasoning, answer)` candidates.
-- **Output:** `output/raw_candidates.jsonl` (resumable: re-running skips already-generated IDs).
+- **What it does:**
+  1. **Strips boilerplate:** Removes web-scrape navigation headers from raw legal `.txt` files.
+  2. **Classifies document kind before assigning a task type:** Inspects each sampled document first so task formats always match the document's nature (and balances counts across compatible formats within each domain):
+     - *Contracts & Agreements:* Eligible for all 4 formats (`issue_spotting_and_risk_redline`, `legal_memo`, `compliance_checklist_table`, `clause_extraction_qa`).
+     - *Judicial Opinions (`court_*`, case holdings):* Matched only to `legal_memo` or `clause_extraction_qa` (never forced into contract redlines).
+     - *Statutes, Regulations & Tax Instructions:* Matched to `compliance_checklist_table`, `legal_memo`, or `clause_extraction_qa`.
+     - *Teacher override (`selected_task_type`):* `gemini-argon-4` can also switch to another compatible task type if the specific excerpt lacks structure for the preferred type.
+  3. **Parallel Teacher synthesis:** Calls `gemini-argon-4` (with `SKILL.md` injected) across multi-threaded workers to generate `(task_prompt, rubric, reasoning, answer)` strictly grounded in the 1-2 sampled documents.
+- **Output:** `output/raw_candidates.jsonl` (resumable: re-running skips already-generated case slots).
 
 ### Stage 3: Deduplication, Judge Verification & Holdout Split (`stage3_clean_and_filter.py`)
-- **Input:** `output/raw_candidates.jsonl`, `skills/sft_rl_synthesis/SKILL.md`, and Judge API (reuses `gemini-argon-4` at `temperature=0.0` unless separate `JUDGE_*` keys are set).
-- **What it does:** Runs deterministic structural/packet-grounding checks, drops exact and near-duplicate answers (5-gram Jaccard similarity), grades every candidate against its atomic rubric, keeps only verified high-quality rows (`rubric_score >= 0.90`), and splits them deterministically (`md5(row["id"])`):
+- **Input:** `output/raw_candidates.jsonl`, `skills/sft_rl_synthesis/SKILL.md`, and Judge API (automatically reuses `gemini-argon-4` at `temperature=0.0` unless separate `JUDGE_*` keys are set).
+- **What it does:** Enforces structural and packet-grounding checks, removes exact and near-duplicate samples (5-gram Jaccard similarity), grades every candidate against its atomic rubric, keeps only verified rows (`rubric_score >= 0.90`), and splits them deterministically (`md5(row["id"])`):
   - **90% Train:** Written to `output/sft_train.jsonl` (pointwise SFT) and `output/rl_prompts.jsonl` (GRPO / RFT prompts + rubrics).
   - **10% Locked Holdout:** Written **exclusively** to `output/holdout_eval.jsonl` (never included in SFT, RL, or DPO training).
 - **Output:** `output/sft_train.jsonl`, `output/rl_prompts.jsonl`, `output/holdout_eval.jsonl`, and `output/filter_stats.json`.
@@ -35,26 +42,28 @@ Contamination-free 5-stage synthetic legal data generation, rubric verification,
 
 ---
 
-## How `eval_feedback.json` Works (Round 1 vs. Round 2 Loop)
+## How Domains, `--samples-per-domain`, and Quota Boosting Connect
 
-`output/eval_feedback.json` is the automatic hard-domain scorecard connecting Stage 4 back to Stage 1:
+### 1. Domains x Cases Per Domain
+- `--limit-domains D` chooses how many domain folders to run (default = all `49`).
+- `--samples-per-domain N` sets the base quota of `N` cases per domain (`Total Round-1 cases = D x N`).
+- Inside each domain, Stage 2 balances those `N` cases evenly across whichever of the 4 task types are compatible with the sampled documents in that folder.
 
-1. **Round 1 (First Run -- `eval_feedback.json` does not exist yet):**
-   Stage 1 gives every one of the 49 legal domains the exact same quota (for example, `--samples-per-domain 20` -> `20` tasks per domain). If you only want a single data-generation pass (`--skip-student-eval`), you never need `eval_feedback.json`.
-2. **After Stage 4 Runs (`eval_feedback.json` now exists):**
-   Stage 4 tests `Qwen/Qwen3.5-9B` and records per-domain scores (e.g., `01_delaware_corporate: 0.88`, `14_tax_controversy: 0.42`).
-3. **Round 2 (Re-running `run_pipeline.py`):**
-   Stage 1 automatically reads `output/eval_feedback.json` and boosts quotas **only** on weak domains while skipping already-generated IDs:
-   - **Domain score `>= 0.70`:** Quota stays `20` (`0` new API calls spent on easy domains).
-   - **Domain score `0.50 - 0.69`:** Quota boosted **`1.75x`** (`20 -> 35`, generating `15` extra tasks).
-   - **Domain score `< 0.50`:** Quota boosted **`2.5x`** (`20 -> 50`, generating `30` extra tasks).
+### 2. Quota Boosting via `eval_feedback.json` (Round 1 vs. Round 2)
+`--samples-per-domain N` sets the **base** count (`base = N`), and Stage 1 multiplies it by a feedback multiplier (`quota = base * multiplier`):
+
+- **Round 1 (no `eval_feedback.json` yet):** `multiplier = 1.0` everywhere. Passing `--samples-per-domain 20` creates `20` cases in every domain. (If you only run a single pass with `--skip-student-eval`, `eval_feedback.json` is never needed.)
+- **Round 2 (after Stage 4 writes `output/eval_feedback.json`):** Even if you pass the exact same `--samples-per-domain 20` command again, Stage 1 automatically boosts weak domains while Stage 2 skips the `0..19` cases already generated:
+  - **Strong domain (`score >= 0.70`, e.g. `0.90`):** `20 * 1.0 = 20` -> `0` new API calls wasted on an easy domain.
+  - **Medium-weak domain (`0.50 - 0.69`):** `20 * 1.75 = 35` -> generates **`15` new** training cases (`case_0020..0034`).
+  - **Very weak domain (`score < 0.50`, e.g. `0.40`):** `20 * 2.5 = 50` -> generates **`30` new** training cases (`case_0020..0049`).
 
 ---
 
 ## Supporting Files
 
 - `api_keys.env`: Single config file for `TEACHER_API_KEY`, `TEACHER_MODEL` (`gemini-argon-4`), optional `JUDGE_*`, and optional `STUDENT_*` endpoints (auto-loaded on startup).
-- `skills/sft_rl_synthesis/SKILL.md`: Synthesis and grading rules injected into Teacher and Judge system prompts (closed-world packet grounding, multi-clause legal tasks, 4-7 atomic rubric checks for GRPO variance, clean `<think>` reasoning with zero meta-leakage).
+- `skills/sft_rl_synthesis/SKILL.md`: Synthesis and grading rules injected into Teacher and Judge system prompts (closed-world packet grounding, content-aware task matching, 4-7 atomic rubric checks for GRPO variance, clean `<think>` reasoning with zero meta-leakage).
 - `llm_client.py`: Unified HTTP client supporting native Google Gemini `generateContent` and OpenAI-compatible `/chat/completions` endpoints, plus `--mock` offline testing.
 - `run_pipeline.py`: Main CLI orchestrator running Stages 1 through 5.
 
