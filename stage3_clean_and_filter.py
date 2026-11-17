@@ -148,37 +148,27 @@ def run_stage3_filter_and_split(
     rl_path = out_dir / "rl_prompts.jsonl"
     holdout_path = out_dir / "holdout_eval.jsonl"
 
+    # Split first, then write. If the holdout would be empty, MOVE (not copy) one row
+    # from train to holdout so no row is ever in both sets.
+    train_rows, hold_rows = [], []
+    for r in verified:
+        bucket = int(hashlib.md5(r["id"].encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
+        (hold_rows if bucket < holdout_ratio else train_rows).append(r)
+    if not hold_rows and len(train_rows) > 1:
+        hold_rows.append(train_rows.pop())
     with (
         sft_path.open("w", encoding="utf-8") as fsft,
         rl_path.open("w", encoding="utf-8") as frl,
         holdout_path.open("w", encoding="utf-8") as fhold,
     ):
-        for r in verified:
-            bucket = int(hashlib.md5(r["id"].encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
-            if bucket < holdout_ratio:
-                fhold.write(json.dumps(r, ensure_ascii=True) + "\n")
-                stats["holdout_eval"] += 1
-            else:
-                fsft.write(json.dumps(r, ensure_ascii=True) + "\n")
-                frl.write(
-                    json.dumps(
-                        {
-                            "id": r["id"],
-                            "domain": r["domain"],
-                            "task_type": r["task_type"],
-                            "prompt": [r["messages"][0]],
-                            "rubric": r["rubric"],
-                        },
-                        ensure_ascii=True,
-                    )
-                    + "\n"
-                )
-                stats["sft_train"] += 1
-
-    # Ensure holdout has at least 1 row on tiny smoke runs
-    if stats["holdout_eval"] == 0 and verified:
-        holdout_path.write_text(json.dumps(verified[-1], ensure_ascii=True) + "\n", encoding="utf-8")
-        stats["holdout_eval"] = 1
+        for r in hold_rows:
+            fhold.write(json.dumps(r, ensure_ascii=True) + "\n")
+        for r in train_rows:
+            fsft.write(json.dumps(r, ensure_ascii=True) + "\n")
+            frl.write(json.dumps({"id": r["id"], "domain": r["domain"], "task_type": r["task_type"],
+                                  "prompt": [r["messages"][0]], "rubric": r["rubric"]}, ensure_ascii=True) + "\n")
+    stats["sft_train"] = len(train_rows)
+    stats["holdout_eval"] = len(hold_rows)
 
     (out_dir / "filter_stats.json").write_text(json.dumps(stats, indent=2) + "\n", encoding="utf-8")
     return stats
