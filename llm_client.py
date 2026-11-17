@@ -43,7 +43,14 @@ def extract_json_object(text: str) -> dict[str, Any]:
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
         raise ValueError(f"No JSON object found in response: {text[:240]}")
-    return json.loads(text[start : end + 1])
+    blob = text[start : end + 1]
+    try:
+        return json.loads(blob)
+    except json.JSONDecodeError:
+        # Lenient retry: allow raw control characters (newlines/tabs inside strings) and
+        # repair invalid backslash escapes (e.g. "\S" in "\Section", "\$") by doubling them.
+        repaired = re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", blob)
+        return json.loads(repaired, strict=False)
 
 
 class ChatClient:
@@ -54,7 +61,7 @@ class ChatClient:
         model: str,
         api_format: str = "auto",
         mock: bool = False,
-        timeout: int = 240,
+        timeout: int = int(os.environ.get("LLM_TIMEOUT", "900")),
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
