@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import json
+import os
 import random
 import re
 import threading
@@ -304,6 +305,14 @@ def run_stage2_synthesis(
 
     lock = threading.Lock()
     written = 0
+    fail_path = out_jsonl.parent / "stage2_failures.jsonl"
+
+    def _log_failure(job: dict[str, Any], reason: str, detail: str) -> None:
+        with lock:
+            with fail_path.open("a", encoding="utf-8") as ff:
+                ff.write(json.dumps({"slot": job.get("slot_prefix"), "domain": job.get("domain"),
+                                     "task_type": job["spec"]["task_type"], "reason": reason,
+                                     "detail": detail}, ensure_ascii=True) + "\n")
 
     def process_job(job: dict[str, Any]) -> dict[str, Any] | None:
         msgs = build_teacher_prompt(
@@ -315,7 +324,7 @@ def run_stage2_synthesis(
             skill_text=skill_text,
         )
         try:
-            _, raw_out = teacher.complete(msgs, temperature=job["spec"]["temperature"], max_tokens=4096)
+            _, raw_out = teacher.complete(msgs, temperature=job["spec"]["temperature"], max_tokens=int(os.environ.get("TEACHER_MAX_TOKENS", "12000")))
             parsed = extract_json_object(raw_out)
             prompt_txt = str(parsed.get("task_prompt", "")).strip()
             answer_txt = str(parsed.get("answer", "")).strip()
@@ -326,6 +335,7 @@ def run_stage2_synthesis(
                 final_task_type = job["spec"]["task_type"]
 
             if not prompt_txt or not answer_txt or not isinstance(rubric, list) or not rubric:
+                _log_failure(job, "missing_fields_or_unparsed_json", raw_out[-300:] if raw_out else "")
                 return None
 
             packet_block = "\n\n".join(f"=== {name} ===\n{txt}" for name, txt in job["docs"])
@@ -349,7 +359,8 @@ def run_stage2_synthesis(
                 ],
                 "rubric": rubric,
             }
-        except Exception:
+        except Exception as exc:
+            _log_failure(job, type(exc).__name__, str(exc)[:300])
             return None
 
     with out_jsonl.open("a", encoding="utf-8") as fout:
