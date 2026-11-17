@@ -58,7 +58,7 @@ class ChatClient:
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
-        self.model = model
+        self.model = "gemini-4-argon" if model == "gemini-argon-4" else model
         self.api_format = api_format  # "auto", "gemini", or "openai"
         self.mock = mock
         self.timeout = timeout
@@ -112,7 +112,7 @@ class ChatClient:
             or get_var("GEMINI_API_KEY")
             or get_var("GOOGLE_API_KEY")
         )
-        model = cli_model or pick("MODEL") or "gemini-argon-4"
+        model = cli_model or pick("MODEL") or "gemini-4-argon"
 
         if not mock and not api_key:
             raise RuntimeError(
